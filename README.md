@@ -41,3 +41,35 @@ PRM loads [`.emacs-prm-locals.el`](.emacs-prm-locals.el) automatically at startu
 | `prm-owner`, `prm-repo-prefix`, `prm-repo-suffix`, `prm-repo-name`, `prm-username` | Building a default repo name when needed |
 
 If the locals file is missing or incomplete, review buffers and checkout-on-open behavior will not have enough information to resolve local repos.
+
+## Keybindings
+
+### Repo Picker (`*prm-repos*`)
+
+| Key | Command |
+| --- | --- |
+| `n` / `p` | Move to next/previous line |
+| `RET` | Open PR list for repo |
+| `g` | Refresh repo list |
+
+### PR List (`*prm-prs:<repo>*`)
+
+| Key | Command |
+| --- | --- |
+| `n` / `p` | Move to next/previous line |
+| `RET` | Open review buffer for PR |
+| `g` | Refresh PR list |
+
+### Review Buffer (`*prm-review:<repo>#<number>*`)
+
+| Key | Command |
+| --- | --- |
+| `n` / `p` | Move to next/previous thread |
+| `t` | Create new thread at point |
+| `r` | Reply to thread |
+| `R` | Resolve/unresolve thread |
+| `g` | Refetch PR metadata and threads |
+| `o` | Open file at point |
+| `c` | Toggle comment visibility |
+| `d` | Toggle diff visibility |
+| `v` | Toggle resolved comment visibility |
