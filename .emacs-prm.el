@@ -41,6 +41,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'diff-mode)
 (require 'url)
 (require 'json)
@@ -57,6 +58,48 @@
         t t))
 
 (prm--load-locals-file)
+
+;;; ── Logging ───────────────────────────────────────────────────────────────
+
+(defvar prm-verbose-log t
+  "When non-nil, emit step-by-step git and API progress to the minibuffer.
+Set to nil to suppress verbose output; generic milestone messages are
+always shown regardless of this setting.")
+
+(defconst prm--log-buffer "*prm-log*"
+  "Buffer that receives all prm log lines (verbose and generic).")
+
+(defun prm--log-to-buffer (level fmt &rest args)
+  "Append a log line to `prm--log-buffer'.
+LEVEL is a short tag string such as \"verbose\" or \"info\".
+FMT and ARGS are passed to `format'."
+  (let ((line (format "[%s] %s\n" level (apply #'format fmt args))))
+    (with-current-buffer (get-buffer-create prm--log-buffer)
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert line)))))
+
+(defmacro prm--vlog (fmt &rest args)
+  "Log a verbose step.  Always written to `prm--log-buffer'.
+Also echoed to the minibuffer when `prm-verbose-log' is non-nil."
+  `(progn
+     (prm--log-to-buffer "verbose" ,fmt ,@args)
+     (when prm-verbose-log
+       (message (concat "prm: " ,fmt) ,@args)
+       (redisplay))))
+
+(defmacro prm--log (fmt &rest args)
+  "Log a generic milestone.  Always written to `prm--log-buffer' and
+always echoed to the minibuffer, regardless of `prm-verbose-log'."
+  `(progn
+     (prm--log-to-buffer "info" ,fmt ,@args)
+     (message (concat "prm: " ,fmt) ,@args)
+     (redisplay)))
+
+(defun prm-show-log ()
+  "Open the `prm--log-buffer' in another window."
+  (interactive)
+  (pop-to-buffer (get-buffer-create prm--log-buffer)))
 
 ;;; ── Colors and faces ──────────────────────────────────────────────────────
 
@@ -134,9 +177,11 @@
   "query($owner:String!,$repo:String!,$pr:Int!){
      repository(owner:$owner,name:$repo){
        pullRequest(number:$pr){
+         author{ login }
          headRefName
          headRefOid
          baseRefName
+         baseRefOid
          headRepository{ url sshUrl }
          baseRepository{ url sshUrl }
          reviewThreads(first:100){
@@ -155,7 +200,9 @@
 (defvar prm--head-remote-url  nil "PR head repo URL (side-effect of prm--fetch-threads).")
 (defvar prm--head-commit      nil "PR head commit OID (side-effect of prm--fetch-threads).")
 (defvar prm--base-branch      nil "PR base branch (side-effect of prm--fetch-threads).")
+(defvar prm--base-commit      nil "PR base commit OID at the time the PR was opened (side-effect of prm--fetch-threads).")
 (defvar prm--base-remote-url  nil "PR base repo URL (side-effect of prm--fetch-threads).")
+(defvar prm--pr-author        nil "PR author login (side-effect of prm--fetch-threads).")
 
 (defun prm--fetch-threads (repo number)
   "Fetch review threads for PR NUMBER in REPO (\"owner/name\").
@@ -171,9 +218,11 @@ Sets prm--head-branch, prm--head-commit, prm--head-remote-url as side effects."
                         (alist-get 'repository
                           (alist-get 'data resp))))
            (head-repo (alist-get 'headRepository pr-data)))
+      (setq prm--pr-author       (alist-get 'login (alist-get 'author pr-data)))
       (setq prm--head-branch     (alist-get 'headRefName pr-data))
       (setq prm--head-commit     (alist-get 'headRefOid  pr-data))
       (setq prm--base-branch     (alist-get 'baseRefName pr-data))
+      (setq prm--base-commit     (alist-get 'baseRefOid  pr-data))
       (setq prm--head-remote-url (or (alist-get 'sshUrl head-repo)
                                      (alist-get 'url    head-repo)))
       (let ((base-repo (alist-get 'baseRepository pr-data)))
@@ -246,8 +295,8 @@ Logs every remote found and every normalization to *prm-remote-map*."
                     (push (cons norm (cons dir remote-name)) result)))))))))
     (with-current-buffer log-buf
       (insert (format "\n%d entries total.\n" (length result))))
-    (message "prm: remote map built — %d entries. See *prm-remote-map* for details."
-             (length result))
+    (prm--log "remote map built — %d entries. See *prm-remote-map* for details."
+              (length result))
     (setq prm--remote-map (nreverse result))))
 
 (defun prm--ensure-remote-map ()
@@ -272,43 +321,126 @@ Logs every remote found and every normalization to *prm-remote-map*."
       (error "prm: no local remote found for %s (normalized: %s) — run M-x prm-rebuild-remote-map"
              url norm))))
 
-;;; ── Checkout helpers ──────────────────────────────────────────────────────
+;;; ── PR worktree setup ─────────────────────────────────────────────────────
 
-(defun prm--checkout-to (repo-name branch)
-  "Checkout BRANCH in the local repo mapped from REPO-NAME via prm-local-paths."
-  (let ((local-dir (alist-get repo-name prm-local-paths nil nil #'equal)))
-    (if (not local-dir)
-        (progn (message "[%s] checkout: no local path configured" repo-name) nil)
-      (let* ((dir    (expand-file-name local-dir))
-             (entry  (and prm--head-remote-url
-                          (ignore-errors (prm--lookup-remote prm--head-remote-url))))
-             (remote (and entry (cdr entry))))
-        (when (and prm--head-remote-url (not remote))
-          (message "[%s] no local remote found for %s" repo-name prm--head-remote-url))
-        (when remote
-          (let ((out (shell-command-to-string
-                      (format "git -C %s fetch %s %s 2>&1"
-                              (shell-quote-argument dir)
-                              (shell-quote-argument remote)
-                              (shell-quote-argument branch)))))
-            (message "[%s] fetch %s/%s: %s" repo-name remote branch (string-trim out))))
-        (let* ((output (shell-command-to-string
-                        (format "git -C %s checkout %s 2>&1"
-                                (shell-quote-argument dir)
-                                (shell-quote-argument branch))))
-               (ok     (string-match-p "\\(Already on\\|Switched to\\)" output)))
-          (message "[%s] %s checkout %s: %s"
-                   repo-name
-                   (if remote (format "(remote: %s)" remote) "(no remote)")
-                   branch
-                   (string-trim output))
-          ok)))))
+(defun prm--git (dir &rest args)
+  "Run git in DIR with ARGS, return trimmed output."
+  (string-trim
+   (shell-command-to-string
+    (concat "git -C " (shell-quote-argument (expand-file-name dir))
+            " " (mapconcat #'shell-quote-argument args " ")
+            " 2>&1"))))
 
-(defun prm-checkout-all-to (branch)
-  "Checkout BRANCH in every repo listed in prm-local-paths."
-  (interactive "sBranch: ")
-  (dolist (entry prm-local-paths)
-    (prm--checkout-to (car entry) branch)))
+(defun prm--ensure-remote (dir remote-name url)
+  "Add remote REMOTE-NAME with URL in DIR, or update its URL if already present."
+  (let ((existing (split-string
+                   (shell-command-to-string
+                    (format "git -C %s remote 2>/dev/null"
+                            (shell-quote-argument (expand-file-name dir))))
+                   "\n" t)))
+    (if (member remote-name existing)
+        (prm--git dir "remote" "set-url" remote-name url)
+      (prm--git dir "remote" "add" remote-name url))))
+
+(defun prm--dir-knows-base-url-p (dir base-url)
+  "Return non-nil if DIR already has some remote whose URL normalizes to BASE-URL."
+  (prm--ensure-remote-map)
+  (let ((norm (prm--normalize-remote-url base-url)))
+    (cl-some (lambda (entry)
+               (and (string= (car entry) norm)
+                    (string= (expand-file-name (cadr entry)) (expand-file-name dir))))
+             prm--remote-map)))
+
+(defun prm--prepare-pr-worktree (dir author pr-number
+                                 head-url head-branch
+                                 base-url base-branch)
+  "Set up DIR for reviewing PR PR-NUMBER by AUTHOR.
+Adds prm remotes, fetches head+base, creates and checks out a local PR branch.
+Returns (LOCAL-BRANCH . BASE-REF) on success, nil if DIR is not a clone of
+the PR base repo."
+  (cl-block prm--prepare-pr-worktree
+    (let ((dir (expand-file-name dir)))
+      (unless (prm--dir-knows-base-url-p dir base-url)
+        (prm--vlog "[%s] no remote matches %s — skipping" dir base-url)
+        (cl-return-from prm--prepare-pr-worktree nil))
+      (let* ((head-remote  (format "prm_%s_%d_head" author pr-number))
+             (base-remote  (format "prm_%s_%d_base" author pr-number))
+             (local-branch (format "prm_%d_head" pr-number))
+             (base-ref     (format "%s/%s" base-remote base-branch)))
+        (prm--vlog "[%s] ensuring remote %s → %s" dir head-remote head-url)
+        (prm--ensure-remote dir head-remote head-url)
+        (prm--vlog "[%s] ensuring remote %s → %s" dir base-remote base-url)
+        (prm--ensure-remote dir base-remote base-url)
+        (prm--vlog "[%s] fetching %s %s" dir base-remote base-branch)
+        (prm--git dir "fetch" base-remote base-branch)
+        (prm--vlog "[%s] fetching %s %s" dir head-remote head-branch)
+        (prm--git dir "fetch" head-remote head-branch)
+        (prm--vlog "[%s] branch -f %s %s/%s" dir local-branch head-remote head-branch)
+        (prm--git dir "branch" "-f" local-branch
+                  (format "%s/%s" head-remote head-branch))
+        (prm--vlog "[%s] checkout %s" dir local-branch)
+        (prm--git dir "checkout" local-branch)
+        (setq prm--remote-map nil)
+        (cons local-branch base-ref)))))
+
+;;; ── Cleanup ───────────────────────────────────────────────────────────────
+
+(defun prm-cleanup ()
+  "Remove all prm_-prefixed remotes and local PR branches across `prm-local-paths'."
+  (interactive)
+  (let ((log-buf (get-buffer-create "*prm-cleanup*")))
+    (with-current-buffer log-buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "prm cleanup — %s\n\n"
+                        (format-time-string "%Y-%m-%d %H:%M:%S")))))
+    (dolist (entry prm-local-paths)
+      (let* ((label (car entry))
+             (dir   (expand-file-name (cdr entry))))
+        (with-current-buffer log-buf
+          (insert (format "── %s  (%s)\n" label dir)))
+        (if (not (file-directory-p dir))
+            (with-current-buffer log-buf (insert "   SKIP: directory does not exist\n"))
+          (let* ((remotes (seq-filter
+                           (lambda (r) (string-match-p "^prm_.*_\\(head\\|base\\)$" r))
+                           (split-string
+                            (shell-command-to-string
+                             (format "git -C %s remote 2>/dev/null"
+                                     (shell-quote-argument dir)))
+                            "\n" t)))
+                 (branches (seq-filter
+                            (lambda (b) (string-match-p "^prm_[0-9]+_head$" b))
+                            (split-string
+                             (shell-command-to-string
+                              (format "git -C %s branch --format=%%(refname:short) 2>/dev/null"
+                                      (shell-quote-argument dir)))
+                             "\n" t)))
+                 (current-branch (string-trim
+                                  (shell-command-to-string
+                                   (format "git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null"
+                                           (shell-quote-argument dir))))))
+            (dolist (branch branches)
+              (when (string= branch current-branch)
+                (let ((fallback (or prm-base-branch "master")))
+                  (with-current-buffer log-buf
+                    (insert (format "   checkout fallback %s (was on %s)\n" fallback branch)))
+                  (prm--vlog "[%s] on prm branch — checkout fallback %s" dir fallback)
+                  (prm--git dir "checkout" fallback)))
+              (with-current-buffer log-buf
+                (insert (format "   delete branch %s\n" branch)))
+              (prm--vlog "[%s] delete branch %s" dir branch)
+              (prm--git dir "branch" "-D" branch))
+            (dolist (remote remotes)
+              (with-current-buffer log-buf
+                (insert (format "   remove remote %s\n" remote)))
+              (prm--vlog "[%s] remove remote %s" dir remote)
+              (prm--git dir "remote" "remove" remote))
+            (with-current-buffer log-buf
+              (insert (format "   done: %d branch(es), %d remote(s) removed\n"
+                              (length branches) (length remotes))))))))
+    (setq prm--remote-map nil)
+    (prm--log "cleanup done — see *prm-cleanup* for details")
+    (pop-to-buffer log-buf)))
 
 ;;; ── REST: reply / resolve ─────────────────────────────────────────────────
 
@@ -440,108 +572,123 @@ Logs every remote found and every normalization to *prm-remote-map*."
 
 ;;; ── Git diff ──────────────────────────────────────────────────────────────
 
-(defun prm--git-diff-files (local-repo-path base-branch)
-  "Return list of files changed between BASE-BRANCH and HEAD in LOCAL-REPO-PATH."
+(defun prm--git-diff-files (local-repo-path base-oid head-oid)
+  "Return list of files changed between BASE-OID and HEAD-OID in LOCAL-REPO-PATH."
   (split-string
    (string-trim
     (shell-command-to-string
-     (format "git -C %s diff %s..HEAD --name-only"
+     (format "git -C %s diff %s...%s --name-only"
              (shell-quote-argument (expand-file-name local-repo-path))
-             base-branch)))
+             base-oid head-oid)))
    "\n" t))
 
-
-(defun prm--effective-base-branch ()
-  "Return the base branch to diff against: buffer-local PR base, else prm-base-branch."
-  (or prm--review-base-branch prm-base-branch))
+(defvar-local prm--review-head-commit nil "Head commit OID for the current review buffer.")
 
 (defun prm--git-diff (path)
-  "Return git diff output for PATH using buffer-local prm--local-repo-path."
+  "Return git diff output for PATH using buffer-local OIDs."
   (shell-command-to-string
-   (format "git -C %s diff %s..HEAD -- %s"
+   (format "git -C %s diff %s...%s -- %s"
            (shell-quote-argument (expand-file-name
                                   (or prm--local-repo-path prm-repo-path)))
-           (prm--effective-base-branch)
+           (or prm--review-base-branch prm-base-branch)
+           (or prm--review-head-commit "HEAD")
            (shell-quote-argument path))))
 
 ;;; ── Level 3: diff review buffer ──────────────────────────────────────────
 
-(defun prm--open-review (full-repo-name pr-number &optional wc refetch)
+(defun prm--open-review (full-repo-name pr-number &optional _wc refetch)
   "Populate the review buffer for PR-NUMBER in FULL-REPO-NAME.
-WC non-nil: checkout PR branch in all local repos after loading.
+_WC is accepted for backwards compat but ignored — checkout now always happens.
 REFETCH non-nil: do not switch to the buffer."
   (setq pr-number (truncate pr-number))
   (let ((buf-name (format "*prm-review:%s#%d*" full-repo-name pr-number)))
-    (message "[%s] PR #%d: fetching threads..." full-repo-name pr-number)
-    (redisplay)
-    (let* ((threads          (prm--fetch-threads full-repo-name pr-number))
-           (total            (length threads))
-           (base-branch      (or prm--base-branch prm-base-branch))
-           (base-entry       (prm--lookup-remote prm--base-remote-url))
-           (local-repo-path  (car base-entry))
-           (base-remote      (cdr base-entry))
-           (_                (progn
-                               (message "[%s] PR #%d: fetching base %s/%s in %s..."
-                                        full-repo-name pr-number
-                                        base-remote base-branch local-repo-path)
-                               (redisplay)
-                               (shell-command-to-string
-                                (format "git -C %s fetch %s %s 2>&1"
-                                        (shell-quote-argument local-repo-path)
-                                        (shell-quote-argument base-remote)
-                                        (shell-quote-argument base-branch)))))
-           (base-ref         (concat base-remote "/" base-branch))
-           (by-file         (if threads
-                                (seq-group-by (lambda (th) (alist-get 'path th)) threads)
-                              (mapcar (lambda (f) (cons f nil))
-                                      (prm--git-diff-files local-repo-path base-ref))))
-           (nfiles          (length by-file))
-           (buf             (get-buffer-create buf-name)))
-      (message "[%s] PR #%d: %d thread(s) across %d file(s)"
-               full-repo-name pr-number total nfiles)
-      (redisplay)
-      (with-current-buffer buf
-        (let ((inhibit-read-only t)
-              sections)
-          (prm--clear-overlays)
-          (erase-buffer)
-          (let ((idx 0))
-            (dolist (grp by-file)
-              (setq idx (1+ idx))
-              (let* ((path     (car grp))
-                     (nthreads (length (cdr grp))))
-                (message "[%s] PR #%d: [%d/%d] %s (%d thread(s))..."
-                         full-repo-name pr-number idx nfiles path nthreads)
-                (redisplay)
-                (insert (propertize (format "══ %s ══\n" path)
-                                    'face '(:foreground "cyan" :weight bold)))
-                (let ((diff-start (point)))
-                  (insert (let ((prm--local-repo-path  local-repo-path)
-                                (prm--review-base-branch base-ref))
-                            (prm--git-diff path)))
-                  (unless (bolp) (insert "\n"))
-                  (push (list (cdr grp) diff-start (point)) sections)))))
-          (diff-mode)
-          (prm-review-mode 1)
-          (setq prm--repo               full-repo-name
-                prm--pr-number          pr-number
-                prm--local-repo-path    local-repo-path
-                prm--review-commit      prm--head-commit
-                prm--review-base-branch base-ref)
-          (dolist (section (nreverse sections))
-            (let ((threads-for-file (nth 0 section))
-                  (diff-start       (nth 1 section))
-                  (diff-end         (nth 2 section)))
-              (dolist (thread threads-for-file)
-                (prm--add-overlay thread diff-start diff-end))))
-          (goto-char (point-min)))
-        (setq buffer-read-only t))
-      (unless refetch
-        (pop-to-buffer buf))
-      (when (and wc prm--head-branch)
-        (prm-checkout-all-to prm--head-branch))
-      (message "[%s] PR #%d: done. %d thread(s) in %d file(s)."
-               full-repo-name pr-number total nfiles))))
+    (prm--log "[%s] PR #%d: fetching threads..." full-repo-name pr-number)
+    (let* ((threads (prm--fetch-threads full-repo-name pr-number))
+           (total   (length threads))
+           (author  (or prm--pr-author "unknown"))
+           worktree-result
+           local-repo-path
+           base-ref)
+      (prm--vlog "[%s] PR #%d: author=%s head=%s base=%s"
+                 full-repo-name pr-number author prm--head-branch
+                 (or prm--base-branch prm-base-branch))
+      ;; Set up prm remotes + branch in every eligible local repo.
+      (dolist (entry prm-local-paths)
+        (let* ((label (car entry))
+               (dir   (expand-file-name (cdr entry)))
+               (result (progn
+                         (prm--vlog "[%s] PR #%d: preparing worktree in %s (%s)..."
+                                    full-repo-name pr-number dir label)
+                         (prm--prepare-pr-worktree
+                          dir author pr-number
+                          prm--head-remote-url prm--head-branch
+                          prm--base-remote-url (or prm--base-branch prm-base-branch)))))
+          (when result
+            (prm--vlog "[%s] PR #%d: worktree ready in %s — branch=%s base-ref=%s"
+                       full-repo-name pr-number dir (car result) (cdr result)))
+          (when (and result (null worktree-result))
+            (setq worktree-result result
+                  local-repo-path dir
+                  base-ref        (cdr result)))))
+      (unless local-repo-path
+        (error "prm: no local repo found for base URL %s — run M-x prm-rebuild-remote-map"
+               prm--base-remote-url))
+      ;; Prefer the exact OID the PR was opened against over the branch tip.
+      (when prm--base-commit
+        (setq base-ref prm--base-commit))
+      (prm--vlog "[%s] PR #%d: using local-repo-path=%s base-ref=%s"
+                 full-repo-name pr-number local-repo-path base-ref)
+      (let* ((head-oid (or prm--head-commit "HEAD"))
+             (all-files (prm--git-diff-files local-repo-path base-ref head-oid))
+             (threads-by-file (seq-group-by (lambda (th) (alist-get 'path th)) threads))
+             (by-file (mapcar (lambda (f)
+                                (cons f (cdr (assoc f threads-by-file))))
+                              all-files))
+             (nfiles  (length by-file))
+             (buf     (get-buffer-create buf-name)))
+        (prm--log "[%s] PR #%d: %d thread(s) across %d file(s)"
+                  full-repo-name pr-number total nfiles)
+        (with-current-buffer buf
+          (let ((inhibit-read-only t)
+                sections)
+            (prm--clear-overlays)
+            (erase-buffer)
+            (let ((idx 0))
+              (dolist (grp by-file)
+                (setq idx (1+ idx))
+                (let* ((path     (car grp))
+                       (nthreads (length (cdr grp))))
+                  (prm--vlog "[%s] PR #%d: [%d/%d] diff %s (%d thread(s))"
+                             full-repo-name pr-number idx nfiles path nthreads)
+                  (insert (propertize (format "══ %s ══\n" path)
+                                      'face '(:foreground "cyan" :weight bold)))
+                  (let ((diff-start (point)))
+                    (insert (let ((prm--local-repo-path    local-repo-path)
+                                  (prm--review-base-branch base-ref)
+                                  (prm--review-head-commit head-oid))
+                              (prm--git-diff path)))
+                    (unless (bolp) (insert "\n"))
+                    (push (list (cdr grp) diff-start (point)) sections)))))
+            (diff-mode)
+            (prm-review-mode 1)
+            (setq prm--repo               full-repo-name
+                  prm--pr-number          pr-number
+                  prm--local-repo-path    local-repo-path
+                  prm--review-commit      prm--head-commit
+                  prm--review-base-branch base-ref
+                  prm--review-head-commit head-oid)
+            (dolist (section (nreverse sections))
+              (let ((threads-for-file (nth 0 section))
+                    (diff-start       (nth 1 section))
+                    (diff-end         (nth 2 section)))
+                (dolist (thread threads-for-file)
+                  (prm--add-overlay thread diff-start diff-end))))
+            (goto-char (point-min)))
+          (setq buffer-read-only t))
+        (unless refetch
+          (pop-to-buffer buf))
+        (prm--log "[%s] PR #%d: done — %d thread(s) in %d file(s)"
+                  full-repo-name pr-number total nfiles)))))
 
 ;;; ── Level 3: interactive commands ────────────────────────────────────────
 
@@ -601,7 +748,7 @@ REFETCH non-nil: do not switch to the buffer."
       (when (string-empty-p body)
         (user-error "Comment body cannot be empty"))
       (prm--create-thread prm--repo prm--pr-number commit path line body)
-      (message "Thread created. Press g to refresh."))))
+      (prm--log "thread created on %s:%d — press g to refresh" path line))))
 
 (defun prm--thread-at-point ()
   (cl-some (lambda (ov) (overlay-get ov 'prm-thread))
@@ -614,8 +761,8 @@ REFETCH non-nil: do not switch to the buffer."
          (comments (alist-get 'nodes (alist-get 'comments thread)))
          (last-id  (truncate (alist-get 'databaseId (car (last comments)))))
          (body     (read-string "Reply: ")))
-    (prm--reply prm--repo prm--pr-number last-id body)
-    (message "Reply sent.")))
+    (prm--log "reply sent to thread — press g to refresh")
+    (prm--reply prm--repo prm--pr-number last-id body)))
 
 (defun prm-resolve-at-point ()
   "Resolve the PR thread at point via GraphQL."
@@ -623,7 +770,7 @@ REFETCH non-nil: do not switch to the buffer."
   (let* ((thread (or (prm--thread-at-point) (user-error "No thread at point")))
          (tid    (alist-get 'id thread)))
     (prm--resolve tid)
-    (message "Thread resolved. Press g to refresh.")))
+    (prm--log "thread resolved — press g to refresh")))
 
 (defun prm--move-to-overlay (next-fn limit-p limit-msg)
   (let ((pos (funcall next-fn (point))))
@@ -663,7 +810,7 @@ REFETCH non-nil: do not switch to the buffer."
                  (if prm--comments-visible
                      (overlay-get ov 'prm-after-string)
                    "")))
-  (message "PR comments %s" (if prm--comments-visible "shown" "hidden")))
+  (prm--log "PR comments %s" (if prm--comments-visible "shown" "hidden")))
 
 (defun prm-toggle-resolved ()
   "Toggle visibility of resolved PR thread comments (key: v)."
@@ -677,7 +824,7 @@ REFETCH non-nil: do not switch to the buffer."
                      (if prm--resolved-visible
                          (overlay-get ov 'prm-after-string)
                        "")))))
-  (message "Resolved comments %s" (if prm--resolved-visible "shown" "hidden")))
+  (prm--log "resolved comments %s" (if prm--resolved-visible "shown" "hidden")))
 
 (defun prm-toggle-diff ()
   "Toggle diff visibility, keeping only comment anchor lines (key: d)."
@@ -698,7 +845,7 @@ REFETCH non-nil: do not switch to the buffer."
     (setq prm--diff-visible t)
     (mapc #'delete-overlay prm--diff-hide-overlays)
     (setq prm--diff-hide-overlays nil))
-  (message "Diff %s" (if prm--diff-visible "shown" "hidden")))
+  (prm--log "diff %s" (if prm--diff-visible "shown" "hidden")))
 
 (defun prm-refetch ()
   "Re-fetch threads and refresh the current review buffer."
@@ -761,6 +908,7 @@ Otherwise open the file for the current diff section at the diff line at point."
     (define-key map (kbd "c") #'prm-toggle-comments)
     (define-key map (kbd "v") #'prm-toggle-resolved)
     (define-key map (kbd "d") #'prm-toggle-diff)
+    (define-key map (kbd "?") #'describe-mode)
     map))
 
 (define-minor-mode prm-review-mode
@@ -781,8 +929,7 @@ Otherwise open the file for the current diff section at the diff line at point."
     (erase-buffer)
     (insert (propertize (format "Open PRs — %s\n\n" prm--prs-repo)
                         'face '(:weight bold)))
-    (message "Fetching PRs for %s..." prm--prs-repo)
-    (redisplay)
+    (prm--log "fetching PRs for %s..." prm--prs-repo)
     (let ((prs (prm--fetch-pr-list prm--prs-repo)))
       (setq prm--prs-list prs)
       (if (null prs)
@@ -796,7 +943,7 @@ Otherwise open the file for the current diff section at the diff line at point."
             (insert line))))
       (goto-char (point-min))
       (forward-line 2)
-      (message "Fetched %d PR(s) for %s." (length prs) prm--prs-repo)))
+      (prm--log "fetched %d PR(s) for %s" (length prs) prm--prs-repo)))
   (setq buffer-read-only t))
 
 (defun prm--open-pr-list (full-repo-name &optional wc)
@@ -830,6 +977,7 @@ Otherwise open the file for the current diff section at the diff line at point."
     (define-key map (kbd "p")   #'previous-line)
     (define-key map (kbd "g")   #'prm-prs-refresh)
     (define-key map (kbd "RET") #'prm-prs-open-at-point)
+    (define-key map (kbd "?")   #'describe-mode)
     map))
 
 (define-minor-mode prm-prs-mode
@@ -890,6 +1038,7 @@ Otherwise open the file for the current diff section at the diff line at point."
     (define-key map (kbd "p")   #'previous-line)
     (define-key map (kbd "g")   #'prm-repos-refresh)
     (define-key map (kbd "RET") #'prm-repos-open-at-point)
+    (define-key map (kbd "?")   #'describe-mode)
     map))
 
 (define-minor-mode prm-repos-mode
