@@ -909,6 +909,7 @@ Otherwise open the file for the current diff section at the diff line at point."
     (define-key map (kbd "v") #'prm-toggle-resolved)
     (define-key map (kbd "d") #'prm-toggle-diff)
     (define-key map (kbd "?") #'describe-mode)
+    (define-key map (kbd "q") #'quit-window)
     map))
 
 (define-minor-mode prm-review-mode
@@ -978,6 +979,7 @@ Otherwise open the file for the current diff section at the diff line at point."
     (define-key map (kbd "g")   #'prm-prs-refresh)
     (define-key map (kbd "RET") #'prm-prs-open-at-point)
     (define-key map (kbd "?")   #'describe-mode)
+    (define-key map (kbd "q") #'quit-window)
     map))
 
 (define-minor-mode prm-prs-mode
@@ -1039,6 +1041,7 @@ Otherwise open the file for the current diff section at the diff line at point."
     (define-key map (kbd "g")   #'prm-repos-refresh)
     (define-key map (kbd "RET") #'prm-repos-open-at-point)
     (define-key map (kbd "?")   #'describe-mode)
+    (define-key map (kbd "q")   #'quit-window)
     map))
 
 (define-minor-mode prm-repos-mode
